@@ -28,6 +28,7 @@ use Youshido\GraphQL\Parser\Ast\TypedFragmentReference;
 use Youshido\GraphQL\Parser\Parser;
 use Youshido\GraphQL\Schema\AbstractSchema;
 use Youshido\GraphQL\Type\AbstractType;
+use Youshido\GraphQL\Type\Enum\AbstractEnumType;
 use Youshido\GraphQL\Type\InputObject\AbstractInputObjectType;
 use Youshido\GraphQL\Type\InterfaceType\AbstractInterfaceType;
 use Youshido\GraphQL\Type\ListType\AbstractListType;
@@ -57,7 +58,10 @@ class Processor
     protected $maxComplexity;
 
     /** @var array DeferredResult[] */
-    protected $deferredResults = [];
+    protected $deferredResultsLeaf = [];
+
+    /** @var array DeferredResult[] */
+    protected $deferredResultsComplex = [];
 
     public function __construct(AbstractSchema $schema)
     {
@@ -87,14 +91,20 @@ class Processor
 
             foreach ($this->executionContext->getRequest()->getAllOperations() as $query) {
                 if ($operationResult = $this->resolveQuery($query)) {
-                    $this->data = array_merge($this->data, $operationResult);
+                    $this->data = array_replace_recursive($this->data, $operationResult);
                 };
             }
 
             // If the processor found any deferred results, resolve them now.
-            if (!empty($this->data) && $this->deferredResults) {
+            if (!empty($this->data) && (!empty($this->deferredResultsLeaf) || !empty($this->deferredResultsComplex))) {
               try {
-                  while ($deferredResolver = array_shift($this->deferredResults)) {
+                  while ($deferredResolver = array_shift($this->deferredResultsComplex)) {
+                      $deferredResolver->resolve();
+                  }
+
+                  // Deferred scalar and enum fields should be resolved last to
+                  // pick up as many as possible for a single batch.
+                  while ($deferredResolver = array_shift($this->deferredResultsLeaf)) {
                       $deferredResolver->resolve();
                   }
               } catch (\Exception $e) {
@@ -342,7 +352,7 @@ class Processor
                             }
                         }
 
-                        continue;
+                        continue 2;
                     }
 
                     $result = array_replace_recursive($result, $this->collectResult($field, $type, $astField, $resolvedValue));
@@ -354,17 +364,16 @@ class Processor
                     $astFragmentModel = $astFragment->getModel();
                     $typeName         = $type->getName();
 
-                    if ($typeName !== $astFragmentModel) {
+                    if ($typeName !== $astFragmentModel && $type->getInterfaces()) {
                         foreach ($type->getInterfaces() as $interface) {
                             if ($interface->getName() === $astFragmentModel) {
                                 $result = array_replace_recursive($result, $this->collectResult($field, $type, $astFragment, $resolvedValue));
 
                                 break;
                             }
-
                         }
 
-                        continue;
+                        continue 2;
                     }
 
                     $result = array_replace_recursive($result, $this->collectResult($field, $type, $astFragment, $resolvedValue));
@@ -382,12 +391,19 @@ class Processor
     /**
      * Apply post-process callbacks to all deferred resolvers.
      */
-    protected function deferredResolve($resolvedValue, callable $callback) {
+    protected function deferredResolve($resolvedValue, FieldInterface $field, callable $callback) {
         if ($resolvedValue instanceof DeferredResolverInterface) {
             $deferredResult = new DeferredResult($resolvedValue, $callback);
-            // Whenever we stumble upon a deferred resolver, append it to the
-            // queue to be resolved later.
-            $this->deferredResults[] = $deferredResult;
+
+            // Whenever we stumble upon a deferred resolver, add it to the queue
+            // to be resolved later.
+            $type = $field->getType()->getNamedType();
+            if ($type instanceof AbstractScalarType || $type instanceof AbstractEnumType) {
+                array_push($this->deferredResultsLeaf, $deferredResult);
+            } else {
+                array_push($this->deferredResultsComplex, $deferredResult);
+            }
+
             return $deferredResult;
         }
         // For simple values, invoke the callback immediately.
@@ -397,7 +413,7 @@ class Processor
     protected function resolveScalar(FieldInterface $field, AstFieldInterface $ast, $parentValue)
     {
         $resolvedValue = $this->doResolve($field, $ast, $parentValue);
-        return $this->deferredResolve($resolvedValue, function($resolvedValue) use ($field, $ast, $parentValue) {
+        return $this->deferredResolve($resolvedValue, $field, function($resolvedValue) use ($field, $ast, $parentValue) {
             $this->resolveValidator->assertValidResolvedValueForField($field, $resolvedValue);
 
             /** @var AbstractScalarType $type */
@@ -412,7 +428,7 @@ class Processor
         /** @var AstQuery $ast */
         $resolvedValue = $this->doResolve($field, $ast, $parentValue);
 
-        return $this->deferredResolve($resolvedValue, function ($resolvedValue) use ($field, $ast, $parentValue) {
+        return $this->deferredResolve($resolvedValue, $field, function ($resolvedValue) use ($field, $ast, $parentValue) {
             $this->resolveValidator->assertValidResolvedValueForField($field, $resolvedValue);
 
             if (null === $resolvedValue) {
@@ -483,7 +499,7 @@ class Processor
             $resolvedValue = $this->doResolve($field, $ast, $parentValue);
         }
 
-        return $this->deferredResolve($resolvedValue, function ($resolvedValue) use ($field, $ast, $parentValue) {
+        return $this->deferredResolve($resolvedValue, $field, function ($resolvedValue) use ($field, $ast, $parentValue) {
             $this->resolveValidator->assertValidResolvedValueForField($field, $resolvedValue);
 
             if (null === $resolvedValue) {
@@ -504,7 +520,7 @@ class Processor
     {
         /** @var AstQuery $ast */
         $resolvedValue = $this->doResolve($field, $ast, $parentValue);
-        return $this->deferredResolve($resolvedValue, function ($resolvedValue) use ($field, $ast, $parentValue) {
+        return $this->deferredResolve($resolvedValue, $field, function ($resolvedValue) use ($field, $ast, $parentValue) {
             $this->resolveValidator->assertValidResolvedValueForField($field, $resolvedValue);
 
             if (null === $resolvedValue) {
